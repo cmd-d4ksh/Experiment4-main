@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+<style>
+    html, body {
+        margin: 0; padding: 0;
+        width: 100vw; height: 100vh;
+        overflow: hidden;
+    }
+    #map {
+        position: fixed;
+        top: 0; left: 0;
+        width: 100vw; height: 100vh;
+    }
+    #status {
+        position: fixed; bottom: 10px; left: 50%;
+        transform: translateX(-50%);
+        background: rgba(0,0,0,.7); color: #fff;
+        padding: 4px 14px; border-radius: 12px;
+        font: 11px/1 sans-serif; z-index: 9999;
+        display: none; pointer-events: none;
+    }
+    .legend {
+        position: fixed; top: 10px; right: 10px;
+        background: rgba(255,255,255,.93);
+        padding: 8px 12px; border-radius: 6px;
+        font: 11px/1.8 sans-serif; z-index: 9999;
+        box-shadow: 0 1px 5px rgba(0,0,0,.3);
+    }
+    .li { display: flex; align-items: center; }
+    .dot {
+        width: 12px; height: 12px; border-radius: 50%;
+        border: 2px solid #fff; box-shadow: 0 1px 3px rgba(0,0,0,.4);
+        margin-right: 6px;
+    }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="status"></div>
+<div class="legend">
+    <div class="li"><div class="dot" style="background:#e53e3e"></div>Pending</div>
+    <div class="li"><div class="dot" style="background:#d69e2e"></div>In-Transit</div>
+    <div class="li"><div class="dot" style="background:#38a169"></div>Delivered</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+var map, markersLayer, routeLayer;
+var mapReady = false;
+var pendingData = null;
+var cache = {};
+
+var STATUS_COLORS = { 'PENDING':'#e53e3e', 'IN-TRANSIT':'#d69e2e', 'DELIVERED':'#38a169' };
+var PALETTE = ['#3182ce','#805ad5','#d53f8c','#2b6cb0','#6b46c1','#c05621'];
+
+function setStatus(m) {
+    var e = document.getElementById('status');
+    e.textContent = m;
+    e.style.display = m ? 'block' : 'none';
+}
+
+function icon(color) {
+    return L.divIcon({
+        className: '',
+        html: '<div style="width:16px;height:16px;background:' + color +
+              ';border:2.5px solid #fff;border-radius:50%;box-shadow:0 2px 6px rgba(0,0,0,.55)"></div>',
+        iconSize: [16,16], iconAnchor: [8,8], popupAnchor: [0,-10]
+    });
+}
+
+// Wait for full page load, then wait a bit for JavaFX to finalize layout
+window.addEventListener('load', function() {
+    setTimeout(initMap, 200);
+});
+
+function initMap() {
+    if (mapReady) return;
+
+    map = L.map('map', {
+        zoomControl: true,
+        fadeAnimation: false,
+        zoomAnimation: false,
+        markerZoomAnimation: false
+    }).setView([20.5937, 78.9629], 5);
+
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+        crossOrigin: true
+    }).addTo(map);
+
+    markersLayer = L.layerGroup().addTo(map);
+    routeLayer   = L.layerGroup().addTo(map);
+
+    mapReady = true;
+
+    // Hammer invalidateSize repeatedly — catches whatever layout moment JavaFX settles at.
+    // Each call re-measures the container and re-positions tiles; cheap operation.
+    [50, 200, 500, 1000, 2000, 3500].forEach(function(ms) {
+        setTimeout(function() { if (map) map.invalidateSize(true); }, ms);
+    });
+
+    // ResizeObserver catches every container size change (SplitPane drag, window resize,
+    // JavaFX late-layout). This is what fixes the "tiles only in top-left quadrant" issue:
+    // the WebView reports a smaller size on initial measure, then grows — Leaflet needs to
+    // be told. Throttled via rAF so rapid drags don't thrash.
+    if (typeof ResizeObserver !== 'undefined') {
+        var rafPending = false;
+        var ro = new ResizeObserver(function() {
+            if (rafPending) return;
+            rafPending = true;
+            requestAnimationFrame(function() {
+                rafPending = false;
+                if (map) map.invalidateSize(true);
+            });
+        });
+        ro.observe(document.getElementById('map'));
+    }
+
+    if (pendingData) {
+        render(pendingData);
+        pendingData = null;
+    }
+}
+
+// Window resize (rare in WebView but handle it)
+window.addEventListener('resize', function() {
+    if (map) map.invalidateSize(true);
+});
+
+function geocode(addr, cb) {
+    if (cache[addr]) { setTimeout(function(){ cb(null, cache[addr]); }, 0); return; }
+    fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(addr),
+          { headers: { 'Accept':'application/json' } })
+        .then(function(r){ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+        .then(function(d){
+            if (d && d.length > 0) {
+                var c = { lat: parseFloat(d[0].lat), lon: parseFloat(d[0].lon) };
+                cache[addr] = c;
+                cb(null, c);
+            } else cb('Not found');
+        })
+        .catch(function(e){ cb(e.toString()); });
+}
+
+function render(deliveries) {
+    markersLayer.clearLayers();
+    routeLayer.clearLayers();
+
+    if (!deliveries || deliveries.length === 0) { setStatus('No deliveries'); return; }
+
+    setStatus('Loading ' + deliveries.length + ' locations...');
+    var resolved = [], left = deliveries.length;
+
+    deliveries.forEach(function(d) {
+        geocode(d.address, function(err, c) {
+            if (!err) {
+                var color = STATUS_COLORS[d.status] || '#718096';
+                L.marker([c.lat, c.lon], { icon: icon(color), deliveryAddress: d.address })
+                    .bindPopup(
+                        '<b>Delivery #' + d.id + '</b><br>' +
+                        '<small>' + d.address + '</small><br>' +
+                        '<span style="color:' + color + ';font-weight:bold">' + d.status + '</span> — Driver #' + d.driverId
+                    )
+                    .addTo(markersLayer);
+                resolved.push({ lat: c.lat, lon: c.lon, dId: d.driverId });
+            }
+            if (--left === 0) {
+                setStatus('');
+                if (resolved.length === 0) { setStatus('No addresses could be located'); return; }
+
+                var byDriver = {};
+                resolved.forEach(function(x){ (byDriver[x.dId] = byDriver[x.dId] || []).push([x.lat, x.lon]); });
+                var di = 0;
+                Object.keys(byDriver).forEach(function(id){
+                    var pts = byDriver[id];
+                    if (pts.length > 1) {
+                        L.polyline(pts, {
+                            color: PALETTE[di % PALETTE.length],
+                            weight: 3, opacity: 0.65, dashArray: '8 5'
+                        }).addTo(routeLayer);
+                    }
+                    di++;
+                });
+
+                // Compute median centre of resolved points and filter outliers (>2000 km from median).
+                // Prevents one bad geocode from dragging the view to mid-Pacific.
+                var lats = resolved.map(function(x){ return x.lat; }).sort(function(a,b){ return a-b; });
+                var lons = resolved.map(function(x){ return x.lon; }).sort(function(a,b){ return a-b; });
+                var medLat = lats[Math.floor(lats.length / 2)];
+                var medLon = lons[Math.floor(lons.length / 2)];
+                var inlier = resolved.filter(function(x){
+                    // rough km distance using equirectangular approx
+                    var dx = (x.lon - medLon) * 111 * Math.cos(medLat * Math.PI / 180);
+                    var dy = (x.lat - medLat) * 111;
+                    return Math.sqrt(dx*dx + dy*dy) < 2000;
+                });
+                var pts = (inlier.length > 0 ? inlier : resolved)
+                            .map(function(x){ return [x.lat, x.lon]; });
+                map.fitBounds(L.latLngBounds(pts), { padding: [60, 60], maxZoom: 12 });
+
+                // Invalidate size after fitBounds — JavaFX may still be settling
+                setTimeout(function(){ map.invalidateSize(true); }, 100);
+            }
+        });
+    });
+}
+
+// Called from Java
+function showAllDeliveries(json) {
+    var data;
+    try { data = JSON.parse(json); } catch(e) { setStatus('Parse error'); return; }
+    if (!mapReady) { pendingData = data; return; }
+    render(data);
+}
+
+function routeToAddress(addr) {
+    if (!mapReady) return;
+    var found = false;
+    markersLayer.eachLayer(function(l){
+        if (l.options && l.options.deliveryAddress === addr) {
+            map.setView(l.getLatLng(), Math.max(map.getZoom(), 14));
+            l.openPopup();
+            found = true;
+        }
+    });
+    if (!found) {
+        setStatus('Locating...');
+        geocode(addr, function(err, c){
+            if (err) { setStatus('Not found'); return; }
+            setStatus('');
+            map.setView([c.lat, c.lon], 14);
+        });
+    }
+}
+
+// Called from Java after load
+function invalidateMap() {
+    if (map) map.invalidateSize(true);
+}
+
+// Stub for backward-compat (old code called this)
+function setMapSize() {
+    if (map) map.invalidateSize(true);
+}
+</script>
+</body>
+</html>
